@@ -1,34 +1,48 @@
 import xarray as xr
-# Multi-threading
-from dask.distributed import Client, LocalCluster
-# Cosmetic options
 from rich import print
+from glob import glob
+from tqdm import tqdm
 
-SAVE_PATH = '/scratch/midway2/pjt5/'
+SAVE_PATH = '/scratch/midway2/valencig/'
 
-def load_datasets():
-    print('Loading datasets...')
+def parse_to_daily():
+    print('Parsing to daily data...')
     base_path = '/scratch/midway3/nnn/'
-    open_kwargs = dict(
-        chunks={'time':-1, 'lat':10, 'lon':10},
-        parallel=True,
-        # engine='h5netcdf',
-    )
-    ds_cp = xr.open_mfdataset(f'{base_path}*_cp.nc', **open_kwargs)
-    ds_lsp = xr.open_mfdataset(f'{base_path}*_lsp.nc', **open_kwargs)
-    # ds_cape = xr.open_mfdataset(f'{base_path}*_cape.nc', **open_kwargs)
-    # Merge datasets
-    ds = xr.merge([ds_cp, ds_lsp])
-    return ds
+    cp_files = sorted(glob(f'{base_path}*_cp.nc'))
+    lsp_files = sorted(glob(f'{base_path}*_lsp.nc'))
+    nfiles = len(cp_files)
+    # Select expver for normal ERA5
+    for i, (cp_file, lsp_file) in enumerate(zip(cp_files, lsp_files)):
+        print(f'\t{i} of {nfiles}')
+        ds_cp = xr.load_dataset(cp_file)
+        ds_lsp = xr.load_dataset(lsp_file)
+        try: 
+            ds_cp = ds_cp.sel(expver=1)
+            ds_lsp = ds_lsp.sel(expver=1)
+        except:
+            pass
+        ds = xr.merge([ds_cp, ds_lsp])
+        ds = (
+            ds
+            .coarsen(latitude=4, longitude=4, boundary='trim').sum()
+            .resample(time='1D').sum()
+            .assign(tp=lambda x: x.cp+x.lsp)
+            .rename({'tp': 'daily_tp', 'cp': 'daily_cp', 'lsp': 'daily_lsp'})    
+        ).persist()
+        ds.to_netcdf(f'{SAVE_PATH}/daily-precip/{i}.nc', encoding={
+            'daily_cp': {'dtype': 'float32'},
+            'daily_lsp': {'dtype': 'float32'},
+            'daily_tp': {'dtype': 'float32'},
+        })
 
 
 def detrend(ds):
+    # print('Detrending data...')
     # To obtain monthly means, we need to sum by day of year
     monthly_means = (
         ds.daily_tp
         .groupby('time.month').mean() # get means across months
     )
-    monthly_means.isel(latitude=10, longitude=10).plot()
     # Get long term trends
     linear_fit = (
         ds.daily_tp
@@ -38,38 +52,34 @@ def detrend(ds):
     detrended_tp = ds.daily_tp.groupby('time.month') - monthly_means - fit_values
     return detrended_tp
 
-
+def get_anomalies():
+    print('Determining anomalies...')
+    print('\tOpening data...')
+    ds = xr.open_mfdataset(
+        f'{SAVE_PATH}/daily-precip/*.nc',
+        #chunks = {'time': 500, 'latitude': 10, 'longitude': 10},
+        #parallel=True
+    ).astype('float32')
+    print('\tDetrending data...')
+    detrended_tp = detrend(ds).persist()
+    # Get percentiles and normalized anomaly
+    tp_percentiles = detrended_tp.chunk({'time': -1}).quantile([0.9, 0.95, 0.99, 0.999], dim='time').compute()
+    print('\tGetting normalized anomalies...')
+    normalized_anomaly = (
+        (detrended_tp - detrended_tp.mean('time')).groupby('time.month') / detrended_tp.groupby('time.month').std('time')
+    ).astype('float32').persist()
+    print('\tSaving data...')
+    ds_expanded = ds.assign(
+            tp_percentiles_alltime=tp_percentiles,
+            normalized_daily_tp_anomaly=normalized_anomaly
+        )
+    ds_expanded.to_netcdf(f'{SAVE_PATH}total-daily-precip.nc', encoding={
+        'daily_cp': {'dtype': 'float32'},
+        'daily_lsp': {'dtype': 'float32'},
+        'daily_tp': {'dtype': 'float32'},
+    })
 
 if __name__ == "__main__":
-    # Start cluster (must be single threaded for type safety)
-    cluster = LocalCluster(n_workers=5, threads_per_worker=1)
-    with Client(cluster) as client:
-        print(f'Dask dashboard link: {client.dashboard_link}')
-        # Do stuff...
-        ds = load_datasets()
-        # Edit dataset
-        ds = (
-            ds
-            .assign(tp=lambda x: x.cp+x.lsp)
-            # may remove one lat/lon coordinate if boundaries aren't divisible by 2
-            .coarsen(latitude=2, longitude=2, boundary='trim').sum()
-            .resample(time='1D').mean()
-            .rename({'tp': 'daily_tp', 'cp': 'daily_cp', 'lsp': 'daily_lsp'})
-        )
-        detrended_tp = detrend(ds)
-        # Get percentiles and normalized anomaly
-        print('Obtaining percentiles...')
-        tp_percentiles = detrended_tp.chunk({'time':-1}).quantile([0.9, 0.99, 0.999], dim='time')
-        print('Obtaining normalized anomaly...')
-        normalized_anomaly = (
-            (detrended_tp - detrended_tp.mean('time')).groupby('time.month') / detrended_tp.groupby('time.month').std('time')
-        )
-        print('Saving new dataset...')
-        ds_expanded = ds.assign(
-                tp_percentiles=tp_percentiles,
-                normalized_daily_tp_anomaly=normalized_anomaly
-            )
-        ds_expanded.to_netcdf(f'{SAVE_PATH}edited_daily_tp.nc')
-        print('Done!')
-
-        
+    parse_to_daily()
+    get_anomalies()
+    print('Done!')
