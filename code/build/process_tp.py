@@ -54,13 +54,21 @@ def detrend(ds):
 
 def get_anomalies():
     print('Determining anomalies...')
-    ds = xr.open_mfdataset(f'{SAVE_PATH}/daily-precip/*.nc', parallel=True)
-    detrended_tp = detrend(ds)
+    print('\tOpening data...')
+    ds = xr.open_mfdataset(
+        f'{SAVE_PATH}/daily-precip/*.nc',
+        #chunks = {'time': 500, 'latitude': 10, 'longitude': 10},
+        #parallel=True
+    ).astype('float32')
+    print('\tDetrending data...')
+    detrended_tp = detrend(ds).persist()
     # Get percentiles and normalized anomaly
-    tp_percentiles = detrended_tp.quantile([0.9, 0.95, 0.99, 0.999], dim='time')
+    tp_percentiles = detrended_tp.chunk({'time': -1}).quantile([0.9, 0.95, 0.99, 0.999], dim='time').compute()
+    print('\tGetting normalized anomalies...')
     normalized_anomaly = (
         (detrended_tp - detrended_tp.mean('time')).groupby('time.month') / detrended_tp.groupby('time.month').std('time')
-    )
+    ).astype('float32').persist()
+    print('\tSaving data...')
     ds_expanded = ds.assign(
             tp_percentiles_alltime=tp_percentiles,
             normalized_daily_tp_anomaly=normalized_anomaly
