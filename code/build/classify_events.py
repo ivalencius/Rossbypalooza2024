@@ -151,48 +151,71 @@ class PrecipEvent():
         return False
     
     def __check_for_SurfaceFronts(self):
-        temperature = self.ERA5.temperature.sel(level=900).mean('time')
-        vorticity = self.ERA5.vorticity.sel(level=900).mean('time')
+        # Departure from 900 hPa
+        temperature = self.ERA5.temperature.sel(level=925).mean('time')
+        vorticity = self.ERA5.vorticity.sel(level=925).mean('time')
         lon_grad = wrapped_gradient(temperature, 'longitude')/111 # degree -> km
         lat_grad = wrapped_gradient(temperature, 'latitude')/111
         grads = np.sqrt(lon_grad**2 + lat_grad**2)
         F_param = grads * vorticity
         scale = 0.45/100 # 0.45 K/100 km
         coriolis = metpy.calc.coriolis_parameter(temperature.latitude).values
-        F_star = F_param / (scale*coriolis)
+        F_star = (F_param / (scale*coriolis)).to_dataset(name='F_star').F_star
         F_star.to_netcdf(f'../../data/F-star/{self.id}.nc')
-        # Check if a decent amount of F-star is above 1
-        indicator_proportion = np.sum(F_star >= 1)/F_star.size
-        if indicator_proportion >= 0.2:
-            return True
-        else:
-            return False
+        # # Check if a decent amount of F-star is above 1
+        # indicator_proportion = np.sum(F_star >= 1)/F_star.size
+        # if indicator_proportion >= 0.2:
+        #     return True
+        # else:
+        #     return False
+        # From Smirnov et al. (2015) two or more neighbor gridpoints must be masked to be a front
+        F_star = F_star.values
+        front_cells = F_star.where(F_star >= 1)
+        # Pad array to ensure no edge effects
+        padded = np.pad(front_cells, 1, mode='constant', constant_values=0)
+        # Check if any cells neighbor each other
+        for i in range(front_cells.shape[0]-1):
+            for j in range(front_cells.shape[1]-1):
+                if front_cells[i,j] == 1:
+                    has_neighbor = (
+                        padded[i+1, j] == 1 or
+                        padded[i+1, j+1] == 1 or
+                        padded[i, j+1] == 1 or
+                        padded[i-1, j+1] == 1 or 
+                        padded[i-1, j] == 1 or 
+                        padded[i-1, j-1] == 1 or 
+                        padded[i, j-1] == 1 or
+                        padded[i+1, j-1] == 1
+                    )
+                    if has_neighbor:
+                        return True
+        return False
         
     def __check_for_Thunderstorm(self):
         Cp = 1005 # Specific heat of air [J/kgK]
         L = 2.5e6 # Latent heat of vaporization of liquid water [J/k]
-        g = 2.81 # Gravitational acceleration [m/s2]
+        # g = 9.81 # Gravitational acceleration [m/s2]
         right_before = self.start_date - np.timedelta64(1, 'D')
         T = self.ERA5.temperature.sel(time=right_before)
-        q = self.ERA5.specific_humidity.sel(time=right_before)
-        z = self.ERA5.geopotential.sel(time=right_before)
+        q = self.ERA5.specific_humidity.sel(time=right_before)/1000 # kg/kg to g/kg
+        z = self.ERA5.geopotential.sel(time=right_before) # This is already multiplied by g
         # Now need to determine saturation specific humidity (Classius-Clapyeron -> q_star)
         # Step 1. Saturation vapor pressure
         # https://cran.r-project.org/web/packages/humidity/vignettes/humidity-measures.html
-        e_s = 6.11*np.exp((L/461.52)((1/273.15)-(1/T.sel(level=500))))
+        e_s = 6.11*np.exp((L/461.52)*((1/273.15)-(1/T.sel(level=500))))
         # Step 2. Saturation specific humidity (at 500 hPa)
         q_star = (e_s*0.622)/(500-(1-0.622)*e_s)
-        # Get moist static energy
-        MSE = Cp*T.sel(level=975) + L*q.sel(level=975) + g*z.sel(level=975)
-        MSE_star = Cp*T.sel(level=500) + L*q_star + g*z.sel(level=500)
+        # Get moist static energy (coerce to kJ/kg)
+        MSE = (Cp*T.sel(level=1000) + L*q.sel(level=1000) + z.sel(level=1000))/1000
+        MSE_star = (Cp*T.sel(level=500) + L*q_star + z.sel(level=500))/1000
         # Get CAPE proxy
-        CAPE_p = MSE - MSE_star
-        CAPE_p.to_netcdf(f'../../data/CAPE-p/{self.id}.nc')
+        CAPE_p = xr.combine_by_coords([MSE.to_dataset(name='MSE').drop_vars('level'), MSE_star.to_dataset(name='MSE_star').drop_vars('level')])
+        CAPE_p['CAPE_proxy'] = (CAPE_p.MSE - CAPE_p.MSE_star)
+        CAPE_p.to_netcdf(f'../../data/CAPE-proxy/{self.id}.nc')
         # Get maximum CAPE of that day
-        max_CAPE = CAPE_p.max('time')
         # High CAPE threshold from Tuckman et. al (2022)
-        indicator_proportion = np.sum(max_CAPE >= 1.75)/max_CAPE.size
-        if max_CAPE >= 0.2:
+        indicator_proportion = np.sum(CAPE_p.CAPE_proxy >= 1.75)/CAPE_p.CAPE_proxy.size
+        if indicator_proportion >= 0.2:
             return True
         else:
             return False
@@ -218,6 +241,6 @@ if __name__ == '__main__':
             ds.PPD.values,
         )
         event.add_ERA5()
-        event.add_event()
-        print(repr(event))
-        break
+        # event.add_event()
+        # print(repr(event))
+        
