@@ -1,16 +1,28 @@
 import xarray as xr
 import numpy as np
+import metpy
 from tqdm import tqdm
 import os
 from rich import print
 import warnings
 
 # Datasets
-ERA5 = xr.open_zarr(
-    'gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr',
-    # chunks={'time': 100, 'latitude': -1, 'longitude': -1},
-    )
+ERA5 = xr.open_zarr('gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr',)
 
+def wrapped_gradient(da, coord):
+    """Finds the gradient along a given dimension of a dataarray."""
+
+    dims_of_coord = da.coords[coord].dims
+    if len(dims_of_coord) == 1:
+        dim = dims_of_coord[0]
+    else:
+        raise ValueError('Coordinate ' + coord + ' has multiple dimensions: ' + str(dims_of_coord))
+ 
+    coord_vals = da.coords[coord].values
+    return xr.apply_ufunc(np.gradient, da, coord_vals, kwargs={'axis': -1},
+                      input_core_dims=[[dim], []], output_core_dims=[[dim]],
+                      output_dtypes=[da.dtype])
+    
 def load_IBTrACS():
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
@@ -57,8 +69,8 @@ class PrecipEvent():
         self.bounding_box_5deg = [
             start_centroid[0] - 2.5, # min lon
             start_centroid[0] + 2.5, # max lon
-            start_centroid[1] - 2.5, # min lat
-            start_centroid[1] + 2.5, # max lat
+            np.min([start_centroid[1] - 2.5, start_centroid[1] + 2.5]), # min lat
+            np.max([start_centroid[1] - 2.5, start_centroid[1] + 2.5]), # max lat
         ]
         return None
     
@@ -76,7 +88,7 @@ class PrecipEvent():
         return ',\n'.join("\t[bold black]%s[/bold black]: %s" % item for item in attrs.items())
     
     def add_ERA5(self):
-        file = f'../../data/precip-event-ERA5/{self.id}.nc'
+        file = f'../../data/precip-events-ERA5/{self.id}.nc'
         if os.path.exists(file):
             ERA5_subset = xr.open_dataset(file)
         else:
@@ -84,10 +96,6 @@ class PrecipEvent():
             start_buffer = self.start_date - np.timedelta64(2, 'D')
             end_buffer = self.end_date + np.timedelta64(2, 'D')
             # Need to change latitude slice based on hemisphere
-            if self.bounding_box_5deg[2] > 0:
-                lat_slice = slice(self.bounding_box_5deg[2], self.bounding_box_5deg[3])
-            else:
-                lat_slice = slice(self.bounding_box_5deg[3], self.bounding_box_5deg[2])
             unsaved = ERA5[[
                     'total_precipitation_6hr',
                     'boundary_layer_height',
@@ -95,6 +103,7 @@ class PrecipEvent():
                     # 'mean_vertically_integrated_moisture_divergence',
                     'integrated_vapor_transport',
                     'temperature',
+                    'geopotential',
                     'u_component_of_wind',
                     'v_component_of_wind',
                     'wind_speed',
@@ -105,7 +114,8 @@ class PrecipEvent():
                 ]].sel(
                 time=slice(start_buffer, end_buffer),
                 longitude=slice(self.bounding_box_5deg[0], self.bounding_box_5deg[1]),
-                latitude=lat_slice,
+                # Need to do max lat first
+                latitude=slice(self.bounding_box_5deg[3], self.bounding_box_5deg[2]),
                 # level=slice(600, 1000),
             )
             unsaved.to_netcdf(file)
@@ -139,17 +149,66 @@ class PrecipEvent():
             if good_lon and good_lat:
                 return True
         return False
+    
+    def __check_for_SurfaceFronts(self):
+        temperature = self.ERA5.temperature.sel(level=900).mean('time')
+        vorticity = self.ERA5.vorticity.sel(level=900).mean('time')
+        lon_grad = wrapped_gradient(temperature, 'longitude')/111 # degree -> km
+        lat_grad = wrapped_gradient(temperature, 'latitude')/111
+        grads = np.sqrt(lon_grad**2 + lat_grad**2)
+        F_param = grads * vorticity
+        scale = 0.45/100 # 0.45 K/100 km
+        coriolis = metpy.calc.coriolis_parameter(temperature.latitude).values
+        F_star = F_param / (scale*coriolis)
+        F_star.to_netcdf(f'../../data/F-star/{self.id}.nc')
+        # Check if a decent amount of F-star is above 1
+        indicator_proportion = np.sum(F_star >= 1)/F_star.size
+        if indicator_proportion >= 0.2:
+            return True
+        else:
+            return False
+        
+    def __check_for_Thunderstorm(self):
+        Cp = 1005 # Specific heat of air [J/kgK]
+        L = 2.5e6 # Latent heat of vaporization of liquid water [J/k]
+        g = 2.81 # Gravitational acceleration [m/s2]
+        right_before = self.start_date - np.timedelta64(1, 'D')
+        T = self.ERA5.temperature.sel(time=right_before)
+        q = self.ERA5.specific_humidity.sel(time=right_before)
+        z = self.ERA5.geopotential.sel(time=right_before)
+        # Now need to determine saturation specific humidity (Classius-Clapyeron -> q_star)
+        # Step 1. Saturation vapor pressure
+        # https://cran.r-project.org/web/packages/humidity/vignettes/humidity-measures.html
+        e_s = 6.11*np.exp((L/461.52)((1/273.15)-(1/T.sel(level=500))))
+        # Step 2. Saturation specific humidity (at 500 hPa)
+        q_star = (e_s*0.622)/(500-(1-0.622)*e_s)
+        # Get moist static energy
+        MSE = Cp*T.sel(level=975) + L*q.sel(level=975) + g*z.sel(level=975)
+        MSE_star = Cp*T.sel(level=500) + L*q_star + g*z.sel(level=500)
+        # Get CAPE proxy
+        CAPE_p = MSE - MSE_star
+        CAPE_p.to_netcdf(f'../../data/CAPE-p/{self.id}.nc')
+        # Get maximum CAPE of that day
+        max_CAPE = CAPE_p.max('time')
+        # High CAPE threshold from Tuckman et. al (2022)
+        indicator_proportion = np.sum(max_CAPE >= 1.75)/max_CAPE.size
+        if max_CAPE >= 0.2:
+            return True
+        else:
+            return False
+        
+        
         
     def add_event(self):
         self.is_TC = self.__check_for_TC()
-        # self.is_Frontal = self.check_for_Fronts()
-        # self.is_Thunderstorm = self.check_for_Thunderstorm()
+        self.is_SurfaceFront = self.__check_for_SurfaceFronts()
+        self.is_Thunderstorm = self.__check_for_Thunderstorm()
         return None
     
     
 if __name__ == '__main__':
     event_data = xr.open_dataset('../../data/Ext_Precip_999.nc')
-    for e in tqdm(event_data.event.values, desc='Processing events'):
+    for e in tqdm(sorted(event_data.event.values), desc='Processing events'):
         ds = event_data.sel(event=e)
         event = PrecipEvent(
             e,
