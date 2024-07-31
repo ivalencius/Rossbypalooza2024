@@ -1,10 +1,14 @@
 import xarray as xr
 import numpy as np
-import metpy
+#import metpy
 from tqdm import tqdm
 import os
-from rich import print
+#from rich import print
 import warnings
+
+# For sharing across machines
+START = None
+END = None
 
 # Datasets
 ERA5 = xr.open_zarr('gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr',)
@@ -98,16 +102,16 @@ class PrecipEvent():
             # Need to change latitude slice based on hemisphere
             unsaved = ERA5[[
                     'total_precipitation_6hr',
-                    'boundary_layer_height',
+                    #'boundary_layer_height',
                     # All nan for some reason
                     # 'mean_vertically_integrated_moisture_divergence',
-                    'integrated_vapor_transport',
+                    #'integrated_vapor_transport',
                     'temperature',
                     'geopotential',
-                    'u_component_of_wind',
-                    'v_component_of_wind',
-                    'wind_speed',
-                    'vertical_velocity',
+                    #'u_component_of_wind',
+                    #'v_component_of_wind',
+                    #'wind_speed',
+                    #'vertical_velocity',
                     'vorticity',
                     'specific_humidity',
                     
@@ -154,7 +158,9 @@ class PrecipEvent():
         # Departure from 900 hPa
         temperature = self.ERA5.temperature.sel(level=925).mean('time')
         vorticity = self.ERA5.vorticity.sel(level=925).mean('time')
-        lon_grad = wrapped_gradient(temperature, 'longitude')/111 # degree -> km
+        # Need to take into account latitude when determining longitude conversion
+        lon_km_in_deg = np.cos(np.deg2rad(1))*np.cos(np.deg2rad(np.mean(temperature.latitude)))*6371
+        lon_grad = wrapped_gradient(temperature, 'longitude')/lon_km_in_deg # degree -> km
         lat_grad = wrapped_gradient(temperature, 'latitude')/111
         grads = np.sqrt(lon_grad**2 + lat_grad**2)
         F_param = grads * vorticity
@@ -170,13 +176,15 @@ class PrecipEvent():
         #     return False
         # From Smirnov et al. (2015) two or more neighbor gridpoints must be masked to be a front
         F_star = F_star.values
-        front_cells = F_star.where(F_star >= 1)
+        F_star[F_star >= 1] = 1
+        F_star[F_star < 1] = 0
+        front_cells = F_star
         # Pad array to ensure no edge effects
         padded = np.pad(front_cells, 1, mode='constant', constant_values=0)
         # Check if any cells neighbor each other
         for i in range(front_cells.shape[0]-1):
             for j in range(front_cells.shape[1]-1):
-                if front_cells[i,j] == 1:
+                if padded[i,j] == 1:
                     has_neighbor = (
                         padded[i+1, j] == 1 or
                         padded[i+1, j+1] == 1 or
@@ -230,17 +238,21 @@ class PrecipEvent():
     
     
 if __name__ == '__main__':
-    event_data = xr.open_dataset('../../data/Ext_Precip_999.nc')
-    for e in tqdm(sorted(event_data.event.values), desc='Processing events'):
-        ds = event_data.sel(event=e)
-        event = PrecipEvent(
-            e,
-            ds.start_date.values, ds.end_date.values,
-            (ds.start_lon.item(), ds.start_lat.item()), (ds.end_lon.item(), ds.end_lat.item()),
-            ds.TPV.values,
-            ds.PPD.values,
-        )
-        event.add_ERA5()
-        # event.add_event()
-        # print(repr(event))
-        
+    event_data = xr.open_dataset('../../data/PPD_997_land2.nc')
+    with open('indexes.txt', 'w') as f:
+        for i, e in tqdm(enumerate(sorted(event_data.event.values)[START:END]), desc='Processing events'):
+            ds = event_data.sel(event=e)
+            # Check if event is within IBTrACS date range
+            if ds.start_date.values >= np.datetime64('2024-07-23'):
+                continue
+            event = PrecipEvent(
+                e,
+                ds.start_date.values, ds.end_date.values,
+                (ds.start_lon.item(), ds.start_lat.item()), (ds.end_lon.item(), ds.end_lat.item()),
+                ds.TPV.values,
+                ds.PPD.values,
+            )
+            event.add_ERA5()
+            # event.add_event()
+            # print(repr(event))
+            f.write(f'{e},{START+i}\n')
