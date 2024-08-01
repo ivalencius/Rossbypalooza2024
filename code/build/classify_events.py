@@ -1,14 +1,12 @@
 import xarray as xr
 import numpy as np
-#import metpy
+import polars as pl
+from glob import glob
+import metpy
 from tqdm import tqdm
 import os
-#from rich import print
+from rich import print
 import warnings
-
-# For sharing across machines
-START = None
-END = None
 
 # Datasets
 ERA5 = xr.open_zarr('gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr',)
@@ -156,8 +154,9 @@ class PrecipEvent():
     
     def __check_for_SurfaceFronts(self):
         # Departure from 900 hPa
-        temperature = self.ERA5.temperature.sel(level=925).mean('time')
-        vorticity = self.ERA5.vorticity.sel(level=925).mean('time')
+        right_before = self.start_date - np.timedelta64(6, 'h')
+        temperature = self.ERA5.temperature.sel(level=925).sel(time=right_before)
+        vorticity = self.ERA5.vorticity.sel(level=925).sel(time=right_before)
         # Need to take into account latitude when determining longitude conversion
         lon_km_in_deg = np.cos(np.deg2rad(1))*np.cos(np.deg2rad(np.mean(temperature.latitude)))*6371
         lon_grad = wrapped_gradient(temperature, 'longitude')/lon_km_in_deg # degree -> km
@@ -165,15 +164,14 @@ class PrecipEvent():
         grads = np.sqrt(lon_grad**2 + lat_grad**2)
         F_param = grads * vorticity
         scale = 0.45/100 # 0.45 K/100 km
-        coriolis = metpy.calc.coriolis_parameter(temperature.latitude).values
+        # Need to have coriolis parameter for each grid point
+        coriolis = np.tile(
+            metpy.calc.coriolis_parameter(temperature.latitude).values.T,
+            (temperature.longitude.size, 1)
+        ).T        
         F_star = (F_param / (scale*coriolis)).to_dataset(name='F_star').F_star
+        F_star = F_star.coarsen(longitude=3, latitude=3, boundary='trim').mean()
         F_star.to_netcdf(f'../../data/F-star/{self.id}.nc')
-        # # Check if a decent amount of F-star is above 1
-        # indicator_proportion = np.sum(F_star >= 1)/F_star.size
-        # if indicator_proportion >= 0.2:
-        #     return True
-        # else:
-        #     return False
         # From Smirnov et al. (2015) two or more neighbor gridpoints must be masked to be a front
         F_star = F_star.values
         F_star[F_star >= 1] = 1
@@ -201,11 +199,11 @@ class PrecipEvent():
         
     def __check_for_Thunderstorm(self):
         Cp = 1005 # Specific heat of air [J/kgK]
-        L = 2.5e6 # Latent heat of vaporization of liquid water [J/k]
+        L = 2.5e6 # Latent heat of vaporization of liquid water [J/kg]
         # g = 9.81 # Gravitational acceleration [m/s2]
-        right_before = self.start_date - np.timedelta64(1, 'D')
+        right_before = self.start_date - np.timedelta64(6, 'h')
         T = self.ERA5.temperature.sel(time=right_before)
-        q = self.ERA5.specific_humidity.sel(time=right_before)/1000 # kg/kg to g/kg
+        q = self.ERA5.specific_humidity.sel(time=right_before) # kg/kg to g/kg
         z = self.ERA5.geopotential.sel(time=right_before) # This is already multiplied by g
         # Now need to determine saturation specific humidity (Classius-Clapyeron -> q_star)
         # Step 1. Saturation vapor pressure
@@ -214,7 +212,7 @@ class PrecipEvent():
         # Step 2. Saturation specific humidity (at 500 hPa)
         q_star = (e_s*0.622)/(500-(1-0.622)*e_s)
         # Get moist static energy (coerce to kJ/kg)
-        MSE = (Cp*T.sel(level=1000) + L*q.sel(level=1000) + z.sel(level=1000))/1000
+        MSE = (Cp*T.sel(level=1000) + L*q.sel(level=925) + z.sel(level=1000))/1000
         MSE_star = (Cp*T.sel(level=500) + L*q_star + z.sel(level=500))/1000
         # Get CAPE proxy
         CAPE_p = xr.combine_by_coords([MSE.to_dataset(name='MSE').drop_vars('level'), MSE_star.to_dataset(name='MSE_star').drop_vars('level')])
@@ -223,14 +221,12 @@ class PrecipEvent():
         # Get maximum CAPE of that day
         # High CAPE threshold from Tuckman et. al (2022)
         indicator_proportion = np.sum(CAPE_p.CAPE_proxy >= 1.75)/CAPE_p.CAPE_proxy.size
-        if indicator_proportion >= 0.2:
+        if indicator_proportion >= 0.1:
             return True
         else:
-            return False
+            return False 
         
-        
-        
-    def add_event(self):
+    def add_events(self):
         self.is_TC = self.__check_for_TC()
         self.is_SurfaceFront = self.__check_for_SurfaceFronts()
         self.is_Thunderstorm = self.__check_for_Thunderstorm()
@@ -238,21 +234,38 @@ class PrecipEvent():
     
     
 if __name__ == '__main__':
-    event_data = xr.open_dataset('../../data/PPD_997_land2.nc')
-    with open('indexes.txt', 'w') as f:
-        for i, e in tqdm(enumerate(sorted(event_data.event.values)[START:END]), desc='Processing events'):
+    event_data = xr.open_dataset('../../data/land_only/Raw_event_0_75deg_land_top200.nc')
+    event_files = glob('../../data/precip-events-ERA5/*.nc')
+    event_numbers = [int(f.split('/')[-1].split('.')[0]) for f in event_files]
+    events = []
+    for e in tqdm(sorted(event_numbers), desc='Processing events'):
+        # Check because some Ka Ying ran file for all events, not land
+        try:
             ds = event_data.sel(event=e)
-            # Check if event is within IBTrACS date range
-            if ds.start_date.values >= np.datetime64('2024-07-23'):
-                continue
-            event = PrecipEvent(
-                e,
-                ds.start_date.values, ds.end_date.values,
-                (ds.start_lon.item(), ds.start_lat.item()), (ds.end_lon.item(), ds.end_lat.item()),
-                ds.TPV.values,
-                ds.PPD.values,
-            )
-            event.add_ERA5()
-            # event.add_event()
-            # print(repr(event))
-            f.write(f'{e},{START+i}\n')
+        except:
+            continue
+        # Check if event is within IBTrACS date range
+        if ds.start_date.values >= np.datetime64('2024-07-23'):
+            print('Processing event', e) # flag for bad events
+            continue
+        event = PrecipEvent(
+            e,
+            ds.start_date.values, ds.end_date.values,
+            (ds.start_lon.item(), ds.start_lat.item()), (ds.end_lon.item(), ds.end_lat.item()),
+            ds.TPV.values,
+            ds.PPD.values,
+        )
+        event.add_ERA5()
+        event.add_events()
+        events.append(event)
+    classified_events = pl.DataFrame([
+        pl.Series('event_id', [e.id for e in events], dtype=pl.Int32),
+        pl.Series('start_date', [e.start_date for e in events], dtype=pl.Date),
+        pl.Series('duration_days', [e.duration.astype(np.int16) for e in events], dtype=pl.Int16),
+        pl.Series('start_lon', [e.start_centroid[0] for e in events], dtype=pl.Float32),
+        pl.Series('start_lat', [e.start_centroid[1] for e in events], dtype=pl.Float32),
+        pl.Series('is_TC', [e.is_TC for e in events], dtype=pl.Boolean),
+        pl.Series('is_SurfaceFront', [e.is_SurfaceFront for e in events], dtype=pl.Boolean),
+        pl.Series('is_Thunderstorm', [e.is_Thunderstorm for e in events], dtype=pl.Boolean),
+    ])
+    classified_events.write_csv('../../data/classified_events.csv')
